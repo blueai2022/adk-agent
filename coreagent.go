@@ -38,8 +38,14 @@ func (c *coreAgentClient) SendTurn(ctx context.Context, userInput string) (*Core
 	return nil, nil
 }
 
+func (c *coreAgentClient) ReportAuditFailure(ctx context.Context, failed []AuditResult) error {
+	return nil
+}
+
 type CoreAgentClient interface {
 	SendTurn(ctx context.Context, userInput string) (*CoreAgentResponse, error)
+	// ReportAuditFailure tells the core agent which factors failed the audit.
+	ReportAuditFailure(ctx context.Context, failed []AuditResult) error
 }
 
 func NewCoreAgentClient() (CoreAgentClient, error) {

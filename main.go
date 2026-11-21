@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
 	"google.golang.org/genai"
@@ -38,9 +39,27 @@ func extractUserText(ic agent.InvocationContext) string {
 	return ""
 }
 
-type MedicalFactor struct {
-	ICD10  string `json:"icd10"`
-	Factor string `json:"factor"`
+// routeRating routes the core agent's output to the audit branch of the workflow.
+const routeRating = "rating"
+
+// auditFailureMessage is sent to the user when any factor fails its audit.
+const auditFailureMessage = "We could not complete the automated review of your application, " +
+	"so it is being sent to a human underwriter for review."
+
+// responseOutput converts the response into a JSON-like map. Agent nodes validate
+// their output against a schema, which cannot be done against a struct.
+func responseOutput(resp *CoreAgentResponse) (map[string]any, error) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }
 
 // NewCoreSubAgent wraps CoreAgentClient as a first-class ADK v2 agent.Agent.
@@ -68,6 +87,13 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 
 				// Persist structured response fields into Session State
 				// for downstream audit agents.
+				output, err := responseOutput(resp)
+				if err != nil {
+					yield(nil, err)
+
+					return
+				}
+
 				state := ic.Session().State()
 				if err := state.Set("core:medical_factors", resp.MedicalFactors); err != nil {
 					yield(nil, err)
@@ -92,31 +118,21 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 						return
 					}
 
-					for icd10, factor := range resp.MedicalFactors {
-						factor := MedicalFactor{
-							ICD10:  icd10,
-							Factor: factor,
-						}
+					// Held back until the audit passes; the gather node reads it from state.
+					if err := state.Set("core:user_response", resp.UserResponse); err != nil {
+						yield(nil, err)
 
-						jsonData, err := json.Marshal(factor)
-						if err != nil {
-							yield(nil, err)
-
-							return
-						}
-
-						event := session.NewEvent(ic, ic.InvocationID())
-						event.Author = "core_underwriting_agent"
-						event.Content = genai.NewContentFromText(
-							string(jsonData),
-							genai.RoleModel,
-						)
-
-						ok := yield(event, nil)
-						if !ok {
-							return
-						}
+						return
 					}
+
+					// No Content: the user must not see the rating before it is audited.
+					// The route sends the response on to the audit branch.
+					event := session.NewEvent(ic, ic.InvocationID())
+					event.Author = "core_underwriting_agent"
+					event.Routes = []string{routeRating}
+					event.Output = output
+
+					yield(event, nil)
 
 					return
 				}
@@ -130,12 +146,72 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 				event := session.NewEvent(ic, ic.InvocationID())
 				event.Author = "core_underwriting_agent"
 				event.Content = genai.NewContentFromText(replyText, genai.RoleModel)
-				event.Output = resp // Populates ev.Output for downstream workflow nodes
+				event.Output = output // Populates ev.Output for downstream workflow nodes
 
 				yield(event, nil)
 			}
 		},
 	})
+}
+
+// defaultFactors are always audited, in addition to the medical factors found by the core agent.
+var defaultFactors = []string{"age", "bmi", "tobacco_use"}
+
+// factorsToAudit returns the core agent's medical factors (sorted by ICD-10 code)
+// followed by the default factors, skipping any default already present.
+func factorsToAudit(resp *CoreAgentResponse) []string {
+	var factors []string
+	seen := make(map[string]bool)
+
+	if resp != nil {
+		icd10s := make([]string, 0, len(resp.MedicalFactors))
+		for icd10 := range resp.MedicalFactors {
+			icd10s = append(icd10s, icd10)
+		}
+		sort.Strings(icd10s)
+
+		for _, icd10 := range icd10s {
+			name := resp.MedicalFactors[icd10]
+			seen[strings.ToLower(icd10)] = true
+			seen[strings.ToLower(name)] = true
+			factors = append(factors, fmt.Sprintf("%s: %s", icd10, name))
+		}
+	}
+
+	for _, f := range defaultFactors {
+		if !seen[f] {
+			factors = append(factors, f)
+		}
+	}
+
+	return factors
+}
+
+// gatherAudits decides the final reply once all factors are audited.
+func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResult) (string, error) {
+	var failed []AuditResult
+	for _, r := range results {
+		if !r.Passed {
+			failed = append(failed, r)
+		}
+	}
+
+	if len(failed) > 0 {
+		if err := client.ReportAuditFailure(ctx, failed); err != nil {
+			return "", fmt.Errorf("report audit failure to core agent: %w", err)
+		}
+
+		return auditFailureMessage, nil
+	}
+
+	reply, err := ctx.State().Get("core:user_response")
+	if err != nil {
+		return "", fmt.Errorf("read core agent response: %w", err)
+	}
+
+	text, _ := reply.(string)
+
+	return text, nil
 }
 
 func main() {
@@ -185,8 +261,8 @@ func main() {
 		Model:       llm,
 		Description: "Audits input interpretation of user input and ingestion into state.",
 		Instruction: "retrieve medical factor-specific input rules from ``input_rules`` tool to prepare information " +
-			"needed for auditing, load the audit findings form for the medical factors using ``audit_findings_form`` tool," +
-			"output the findings accordingly as JSON",
+			"needed for auditing, load the audit findings form for the medical factors using ``audit_findings_form`` tool, " +
+			"fill out the form, and report whether the factor passed the audit with the reason and the filled-out form",
 		Tools: []tool.Tool{
 			inputRulesTool,
 			AuditFindingsFormTool,
@@ -196,38 +272,42 @@ func main() {
 		log.Fatalf("Failed to create agent: %v", err)
 	}
 
+	// Producer node: combines the medical factors found by the core agent with the
+	// default factors, and fans the result out across LLM calls.
+	splitFactors := workflow.NewFunctionNode(
+		"split_factors",
+		func(_ agent.Context, resp *CoreAgentResponse) ([]string, error) {
+			return factorsToAudit(resp), nil
+		},
+		cfg,
+	)
+
 	// Audit LlmAgent wrapped in NewAgentNode -> MUST be listed in SubAgents
-	auditNode, err := workflow.NewAgentNode(auditAgent, cfg)
+	auditNode, err := workflow.NewAgentNodeTyped[string, AuditResult](auditAgent, cfg)
 	if err != nil {
 		log.Fatalf("Failed to create audit node: %v", err)
 	}
 
-	// Producer node: generates the []string slice to fan out across LLM calls.
-	splitTopics := workflow.NewFunctionNode(
-		"split_topics",
-		func(_ agent.Context, _ string) ([]string, error) {
-			return []string{"goroutines", "channels", "sync.WaitGroup"}, nil
-		},
-		cfg,
-	)
+	const maxConcurrency = 2
 
 	// ParallelWorker: runs auditNodes concurrently across []string -> []string.
 	// Cap maxConcurrency at 2 to stay within API rate limits.
 	parallelAuditors, err := workflow.NewParallelWorker(
 		"parallel_auditors",
 		auditNode,
-		2, // maxConcurrency
+		maxConcurrency,
 		cfg,
 	)
 	if err != nil {
 		log.Fatalf("Failed to create ParallelWorker: %v", err)
 	}
 
-	// Aggregator node: receives []string in the exact order of the input slice.
-	aggregate := workflow.NewFunctionNode(
-		"aggregate",
-		func(ctx agent.Context, summaries []string) (string, error) {
-			return "=== Parallel Audit Results ===\n" + strings.Join(summaries, "\n"), nil
+	// Gather node: passes the core agent's original reply to the user if every factor
+	// passed the audit; otherwise reports the failure to the core agent and the user.
+	gather := workflow.NewEmittingFunctionNode(
+		"gather_audits",
+		func(ctx agent.Context, results []AuditResult, _ func(*session.Event) error) (string, error) {
+			return gatherAudits(ctx, coreClient, results)
 		},
 		cfg,
 	)
@@ -237,8 +317,16 @@ func main() {
 		Name:        "root_underwriting_workflow",
 		Description: "Runs external core HTTP agent followed by audit agents.",
 		SubAgents:   []agent.Agent{coreSubAgent, auditAgent},
-		Edges:       workflow.Chain(workflow.Start, coreAgentNode, splitTopics, parallelAuditors, aggregate),
+		// Only the rating stage is audited; other stages are already answered by the core agent.
+		Edges: workflow.Concat(
+			workflow.Chain(workflow.Start, coreAgentNode),
+			[]workflow.Edge{{From: coreAgentNode, To: splitFactors, Route: workflow.StringRoute(routeRating)}},
+			workflow.Chain(splitFactors, parallelAuditors, gather),
+		),
 	})
+	if err != nil {
+		log.Fatalf("Failed to create root agent: %v", err)
+	}
 
 	// Save message content in OpenTelemetry logs
 	if err := os.Setenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true"); err != nil {

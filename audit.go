@@ -20,6 +20,14 @@ type FindingsForm struct {
 	Items       []FindingsItem `json:"items"`
 }
 
+// AuditResult is the outcome of auditing one factor.
+type AuditResult struct {
+	Factor   string `json:"factor"`
+	Passed   bool   `json:"passed"`
+	Reason   string `json:"reason"`
+	Findings string `json:"findings"` // the filled-out findings form, as a raw string
+}
+
 // inputRules tool returns a set of input rules for medical factors.
 func inputRules(_ agent.Context, factorICD10 string) (InputRules, error) {
 	return InputRules{
