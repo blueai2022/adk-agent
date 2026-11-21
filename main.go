@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"log"
+
 	"os"
 	"sort"
 	"strings"
@@ -18,25 +18,30 @@ import (
 	"google.golang.org/adk/v2/agent/workflowagent"
 	"google.golang.org/adk/v2/cmd/launcher"
 	"google.golang.org/adk/v2/cmd/launcher/full"
-	"google.golang.org/adk/v2/model/gemini"
+	"google.golang.org/adk/v2/model/openaimodel"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
 	"google.golang.org/adk/v2/workflow"
+
+	"github.com/rs/zerolog/log"
 )
 
-func extractUserText(ic agent.InvocationContext) string {
-	if ic.UserContent() == nil {
+func userText(ctx agent.InvocationContext) string {
+	if ctx.UserContent() == nil {
 		return ""
 	}
 
-	for _, part := range ic.UserContent().Parts {
-		if part.Text != "" {
-			return part.Text
+	var text strings.Builder
+
+	for _, part := range ctx.UserContent().Parts {
+		if part != nil && part.Text != "" {
+			// No separator - follows what ADK does internally
+			text.WriteString(part.Text)
 		}
 	}
 
-	return ""
+	return text.String()
 }
 
 // routeRating routes the core agent's output to the audit branch of the workflow.
@@ -67,9 +72,9 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 	return agent.New(agent.Config{
 		Name:        "core_underwriting_agent",
 		Description: "External underwriting LLM agent that extracts ICD-10 medical factors and factor states.",
-		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
 			return func(yield func(*session.Event, error) bool) {
-				userInput := extractUserText(ic)
+				userInput := userText(ctx)
 				if userInput == "" {
 					yield(nil, fmt.Errorf("core_underwriting_agent: empty user input"))
 
@@ -77,7 +82,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 				}
 
 				// Build an agent.Context from the InvocationContext
-				agentCtx := agent.NewCallbackContext(ic, nil)
+				agentCtx := agent.NewCallbackContext(ctx, nil)
 				resp, err := client.SendTurn(agentCtx, userInput)
 				if err != nil {
 					yield(nil, fmt.Errorf("core_underwriting_agent SendTurn failed: %w", err))
@@ -94,7 +99,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 					return
 				}
 
-				state := ic.Session().State()
+				state := ctx.Session().State()
 				if err := state.Set("core:medical_factors", resp.MedicalFactors); err != nil {
 					yield(nil, err)
 
@@ -127,7 +132,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 
 					// No Content: the user must not see the rating before it is audited.
 					// The route sends the response on to the audit branch.
-					event := session.NewEvent(ic, ic.InvocationID())
+					event := session.NewEvent(ctx, ctx.InvocationID())
 					event.Author = "core_underwriting_agent"
 					event.Routes = []string{routeRating}
 					event.Output = output
@@ -143,7 +148,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 				// Determine the reply message to emit as the agent's conversational output.
 				replyText := resp.UserResponse
 
-				event := session.NewEvent(ic, ic.InvocationID())
+				event := session.NewEvent(ctx, ctx.InvocationID())
 				event.Author = "core_underwriting_agent"
 				event.Content = genai.NewContentFromText(replyText, genai.RoleModel)
 				event.Output = output // Populates ev.Output for downstream workflow nodes
@@ -215,29 +220,43 @@ func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResu
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal().
+			Err(err).
+			Msg("fatal error")
+	}
+}
+
+func run() error {
 	ctx := context.Background()
 
-	llm, err := gemini.NewModel(ctx, "gemini-flash-latest", &genai.ClientConfig{
-		APIKey: os.Getenv("GOOGLE_API_KEY"),
+	flags, err := NewFlags(os.Args)
+	if err != nil {
+		return fmt.Errorf("failed to initialize flags: %v", err)
+	}
+
+	llm, err := openaimodel.NewModel(ctx, flags.Model, &openaimodel.ClientConfig{
+		APIKey:  flags.APIKey,
+		BaseURL: flags.BaseURL,
 	})
 	if err != nil {
-		log.Fatalf("Failed to create model: %v", err)
+		return fmt.Errorf("failed to create model: %w", err)
 	}
 
 	cfg := workflow.NodeConfig{}
 
 	coreClient, err := NewCoreAgentClient()
 	if err != nil {
-		log.Fatalf("Failed to create core client: %v", err)
+		return fmt.Errorf("failed to create core client: %v", err)
 	}
 
 	coreSubAgent, err := NewCoreSubAgent(coreClient)
 	if err != nil {
-		log.Fatalf("Failed to create core sub-agent: %v", err)
+		return fmt.Errorf("failed to create core sub-agent: %v", err)
 	}
 	coreAgentNode, err := workflow.NewAgentNode(coreSubAgent, cfg)
 	if err != nil {
-		log.Fatalf("Failed to create core agent node: %v", err)
+		return fmt.Errorf("failed to create core agent node: %v", err)
 	}
 
 	inputRulesTool, err := functiontool.New(functiontool.Config{
@@ -245,7 +264,7 @@ func main() {
 		Description: "Extracts medical factor-specific input rules.",
 	}, inputRules)
 	if err != nil {
-		log.Fatalf("Failed to create input_rules tool: %v", err)
+		return fmt.Errorf("failed to create input_rules tool: %v", err)
 	}
 
 	AuditFindingsFormTool, err := functiontool.New(functiontool.Config{
@@ -253,7 +272,7 @@ func main() {
 		Description: "Loads the audit findings form for medical factors.",
 	}, auditFindingsForm)
 	if err != nil {
-		log.Fatalf("Failed to create audit_findings_form tool: %v", err)
+		return fmt.Errorf("failed to create audit_findings_form tool: %v", err)
 	}
 
 	auditAgent, err := llmagent.New(llmagent.Config{
@@ -269,7 +288,7 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("Failed to create agent: %v", err)
+		return fmt.Errorf("failed to create agent: %v", err)
 	}
 
 	// Producer node: combines the medical factors found by the core agent with the
@@ -285,7 +304,7 @@ func main() {
 	// Audit LlmAgent wrapped in NewAgentNode -> MUST be listed in SubAgents
 	auditNode, err := workflow.NewAgentNodeTyped[string, AuditResult](auditAgent, cfg)
 	if err != nil {
-		log.Fatalf("Failed to create audit node: %v", err)
+		return fmt.Errorf("failed to create audit node: %v", err)
 	}
 
 	const maxConcurrency = 2
@@ -299,7 +318,7 @@ func main() {
 		cfg,
 	)
 	if err != nil {
-		log.Fatalf("Failed to create ParallelWorker: %v", err)
+		return fmt.Errorf("failed to create ParallelWorker: %v", err)
 	}
 
 	// Gather node: passes the core agent's original reply to the user if every factor
@@ -325,12 +344,12 @@ func main() {
 		),
 	})
 	if err != nil {
-		log.Fatalf("Failed to create root agent: %v", err)
+		return fmt.Errorf("failed to create root agent: %v", err)
 	}
 
 	// Save message content in OpenTelemetry logs
 	if err := os.Setenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true"); err != nil {
-		log.Fatalf("Failed to set env var: %v", err)
+		return fmt.Errorf("failed to set env var: %v", err)
 	}
 
 	config := &launcher.Config{
@@ -339,6 +358,8 @@ func main() {
 
 	launcher := full.NewLauncher()
 	if err = launcher.Execute(ctx, config, os.Args[1:]); err != nil {
-		log.Fatalf("Run failed: %v\n\n%s", err, launcher.CommandLineSyntax())
+		return fmt.Errorf("run failed: %v\n\n%s", err, launcher.CommandLineSyntax())
 	}
+
+	return nil
 }
