@@ -18,10 +18,21 @@ var findingsFormFiles = map[string]string{
 	"dm2":   "artifacts/dm2-audit-findings.md",
 }
 
+//go:embed artifacts/*-input-rules.md
+var inputRulesDocs embed.FS
+
+// inputRulesFiles maps known factor identifiers (ICD-10 code, factor id),
+// to the embedded file holding that factor's input interpretation rules.
+var inputRulesFiles = map[string]string{
+	"e11.9": "artifacts/dm2-input-rules.md",
+	"dm2":   "artifacts/dm2-input-rules.md",
+}
+
 type InputRules struct {
 	FactorICD10 string            `json:"factor_icd10"`
 	Description string            `json:"description"`
-	Fields      map[string]string `json:"fields"` // name -> rule or description of the field
+	Content     string            `json:"content"` // raw markdown input interpretation rules
+	Fields      map[string]string `json:"fields"`  // deprecated
 }
 
 // FindingsItem is currently unused by auditFindingsForm (see FindingsForm.Content).
@@ -48,10 +59,25 @@ type AuditResult struct {
 
 // inputRules tool returns a set of input rules for medical factors.
 func inputRules(_ agent.Context, factorICD10 string) (InputRules, error) {
-	return InputRules{
+	rules := InputRules{
 		FactorICD10: factorICD10,
 		Description: "Input ingestiong rules for the medical factor " + factorICD10,
-	}, nil
+	}
+
+	filename, ok := lookupInputRuleFile(factorICD10)
+	if !ok {
+		rules.Description += " (no input rules authored yet for this factor)"
+
+		return rules, nil
+	}
+
+	content, err := inputRulesDocs.ReadFile(filename)
+	if err != nil {
+		return InputRules{}, fmt.Errorf("failed to read input rules %q: %w", filename, err)
+	}
+	rules.Content = string(content)
+
+	return rules, nil
 }
 
 // auditFindingsForm tool loads the audit findings form for medical factors.
@@ -77,16 +103,30 @@ func auditFindingsForm(_ agent.Context, factorICD10 string) (FindingsForm, error
 	return form, nil
 }
 
+// lookupInputRuleFile resolves a factor identifier to its embedded
+// input rules file. It handles factor identifiers of the form "<code>: <name>"
+// (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
+func lookupInputRuleFile(factorID string) (string, bool) {
+	return lookupFactorArtifact(factorID, inputRulesFiles)
+}
+
 // lookupFindingsFormFile resolves a factor identifier to its embedded
 // findings form file. It handles factor identifiers of the form "<code>: <name>"
 // (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
 func lookupFindingsFormFile(factorID string) (string, bool) {
+	return lookupFactorArtifact(factorID, findingsFormFiles)
+}
+
+// lookupFactorArtifact resolves a factor identifier against registry to its
+// embedded file. It handles factor identifiers of the form "<code>: <name>"
+// (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
+func lookupFactorArtifact(factorID string, registry map[string]string) (string, bool) {
 	for _, part := range strings.SplitN(factorID, ":", 2) {
 		key := strings.ToLower(strings.TrimSpace(part))
 		if key == "" {
 			continue
 		}
-		if filename, ok := findingsFormFiles[key]; ok {
+		if filename, ok := registry[key]; ok {
 			return filename, true
 		}
 	}
