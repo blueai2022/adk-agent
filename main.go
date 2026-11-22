@@ -142,7 +142,8 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 					return
 				}
 
-				// For now, always pass through the user response as the agent's reply.
+				// For now, always pass through the core agent's user response as the
+				// root agent's reply.
 				// TODO: add Language Assistance logic here.
 
 				// Determine the reply message to emit as the agent's conversational output.
@@ -151,7 +152,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 				event := session.NewEvent(ctx, ctx.InvocationID())
 				event.Author = "core_underwriting_agent"
 				event.Content = genai.NewContentFromText(replyText, genai.RoleModel)
-				event.Output = output // Populates ev.Output for downstream workflow nodes
+				event.Output = output // Populates for downstream workflow nodes
 
 				yield(event, nil)
 			}
@@ -214,9 +215,11 @@ func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResu
 		return "", fmt.Errorf("read core agent response: %w", err)
 	}
 
-	text, _ := reply.(string)
+	if text, ok := reply.(string); ok {
+		return text, nil
+	}
 
-	return text, nil
+	return "", fmt.Errorf("core agent response is not a string")
 }
 
 func main() {
@@ -323,7 +326,7 @@ func run() error {
 
 	// Gather node: passes the core agent's original reply to the user if every factor
 	// passed the audit; otherwise reports the failure to the core agent and the user.
-	gather := workflow.NewEmittingFunctionNode(
+	gatherAudits := workflow.NewEmittingFunctionNode(
 		"gather_audits",
 		func(ctx agent.Context, results []AuditResult, _ func(*session.Event) error) (string, error) {
 			return gatherAudits(ctx, coreClient, results)
@@ -340,7 +343,7 @@ func run() error {
 		Edges: workflow.Concat(
 			workflow.Chain(workflow.Start, coreAgentNode),
 			[]workflow.Edge{{From: coreAgentNode, To: splitFactors, Route: workflow.StringRoute(routeRating)}},
-			workflow.Chain(splitFactors, parallelAuditors, gather),
+			workflow.Chain(splitFactors, parallelAuditors, gatherAudits),
 		),
 	})
 	if err != nil {
