@@ -359,9 +359,9 @@ func run() error {
 		AgentLoader: agent.NewSingleLoader(rootAgent),
 	}
 
-	launcher := full.NewLauncher()
-	if err = launcher.Execute(ctx, config, os.Args[1:]); err != nil {
-		return fmt.Errorf("run failed: %v\n\n%s", err, launcher.CommandLineSyntax())
+	agtLauncher := full.NewLauncher()
+	if err = agtLauncher.Execute(ctx, config, os.Args[1:]); err != nil {
+		return fmt.Errorf("run failed: %v\n\n%s", err, agtLauncher.CommandLineSyntax())
 	}
 
 	return nil
