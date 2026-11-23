@@ -110,6 +110,11 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 
 					return
 				}
+				if err := state.Set("core:factor_ids", resp.FactorIDs); err != nil {
+					yield(nil, err)
+
+					return
+				}
 				if err := state.Set("core:factor_states", resp.FactorStates); err != nil {
 					yield(nil, err)
 
@@ -172,7 +177,7 @@ var defaultFactors = []string{"age", "bmi", "tobacco"}
 // followed by the default factors. A factor is audited once: of several medical
 // factors resolving to the same factor ID (e.g. E11.9 and E11.65), only the first
 // is kept, and a default already covered by a medical factor is skipped.
-// Medical factors that do not resolve are kept as they are.
+// Medical factors without a factor ID from the core agent are kept as they are.
 func factorsToAudit(resp *CoreAgentResponse) []string {
 	var factors []string
 	seen := make(map[string]bool)
@@ -185,7 +190,7 @@ func factorsToAudit(resp *CoreAgentResponse) []string {
 		sort.Strings(icd10s)
 
 		for _, icd10 := range icd10s {
-			if id, ok := resolveFactorKey(icd10); ok {
+			if id, ok := resolveFactorKey(icd10, resp.FactorIDs); ok {
 				if seen[id] {
 					continue
 				}

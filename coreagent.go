@@ -17,6 +17,7 @@ type Turn struct {
 
 type CoreAgentResponse struct {
 	MedicalFactors map[string]string // ICD10 -> Description
+	FactorIDs      map[string]string // ICD10 -> factor ID (e.g. E11.9 -> dm2), the key of FactorStates
 	FactorStates   map[string]map[string]any
 	History        []Turn
 	UserResponse   string

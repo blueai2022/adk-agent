@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/session"
 )
 
 //go:embed artifacts/*-audit-findings.md
@@ -20,14 +21,12 @@ var inputRulesDocs embed.FS
 // defaultFindingsKey names the findings file used for factors without their own.
 const defaultFindingsKey = "default"
 
-// icd10Aliases maps lowercase ICD-10 code prefixes (e.g. "e11" covers "e11.9" and
-// "e11.65") to the factor ID of the factor they belong to. A factor ID names the
-// factor's artifact files (artifacts/<id>-input-rules.md, artifacts/<id>-audit-findings.md)
-// and its entry in the core agent's factor states. Besides the alias targets, the
-// default factors are known factor IDs.
-var icd10Aliases = map[string]string{
-	"e11": "dm2",
-}
+// factorIDsKey and factorStatesKey are the session state keys under which the core
+// sub-agent stores the ICD-10 -> factor ID mapping and the per-factor states.
+const (
+	factorIDsKey    = "core:factor_ids"
+	factorStatesKey = "core:factor_states"
+)
 
 // auditBaseInstruction is the factor-independent part of the audit agent's instruction.
 // The factor's findings file is appended to it as the Output section.
@@ -88,14 +87,24 @@ type AuditResult struct {
 }
 
 // inputRules tool returns a set of input rules for medical factors.
-func inputRules(_ agent.Context, args FactorArgs) (InputRules, error) {
-	factorICD10 := args.Factor
+func inputRules(ctx agent.Context, args FactorArgs) (InputRules, error) {
+	factorIDs, err := readFactorIDs(ctx.State())
+	if err != nil {
+		return InputRules{}, err
+	}
+
+	return inputRulesFor(args.Factor, factorIDs)
+}
+
+// inputRulesFor returns the input rules of a factor, resolved against the
+// ICD-10 -> factor ID mapping from the core agent.
+func inputRulesFor(factorICD10 string, factorIDs map[string]string) (InputRules, error) {
 	rules := InputRules{
 		FactorICD10: factorICD10,
 		Description: "Input interpretation rules for the medical factor " + factorICD10,
 	}
 
-	key, ok := resolveFactorKey(factorICD10)
+	key, ok := resolveFactorKey(factorICD10, factorIDs)
 	if !ok {
 		return InputRules{}, fmt.Errorf("unknown factor %q", factorICD10)
 	}
@@ -140,31 +149,52 @@ func newFactorStateTool(stateFn FactorStateFunc) func(agent.Context, FactorArgs)
 // sessionFactorState is the default FactorStateFunc. It reads the factor's entry
 // from the core agent's factor states in session state, which are keyed by factor key.
 func sessionFactorState(ctx agent.Context, factorID string) (map[string]any, error) {
-	raw, err := ctx.State().Get("core:factor_states")
-	if err != nil {
-		// The core sub-agent always stores factor states, so a missing key is a wiring bug.
-		return nil, fmt.Errorf("read core:factor_states: %w", err)
-	}
-
-	return pickFactorState(raw, factorID)
-}
-
-// pickFactorState finds the factor's entry in the core agent's factor states.
-func pickFactorState(raw any, factorID string) (map[string]any, error) {
-	factorKey, ok := resolveFactorKey(factorID)
-	if !ok {
-		return nil, fmt.Errorf("unknown factor %q", factorID)
-	}
-
-	// The stored value may be typed or, after a state round trip, generic JSON.
-	data, err := json.Marshal(raw)
+	factorIDs, err := readFactorIDs(ctx.State())
 	if err != nil {
 		return nil, err
 	}
 
-	var states map[string]map[string]any
-	if err := json.Unmarshal(data, &states); err != nil {
-		return nil, fmt.Errorf("core:factor_states has an unexpected shape: %w", err)
+	// The core sub-agent always stores factor states, so a missing key is a wiring bug.
+	states, err := readState[map[string]map[string]any](ctx.State(), factorStatesKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return pickFactorState(states, factorID, factorIDs)
+}
+
+// readFactorIDs reads the core agent's ICD-10 -> factor ID mapping from session state.
+func readFactorIDs(state session.ReadonlyState) (map[string]string, error) {
+	return readState[map[string]string](state, factorIDsKey)
+}
+
+// readState reads key from session state as a T. The stored value may be typed or,
+// after a state round trip, generic JSON.
+func readState[T any](state session.ReadonlyState, key string) (T, error) {
+	var out T
+
+	raw, err := state.Get(key)
+	if err != nil {
+		return out, fmt.Errorf("read %s: %w", key, err)
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return out, err
+	}
+
+	if err := json.Unmarshal(data, &out); err != nil {
+		return out, fmt.Errorf("%s has an unexpected shape: %w", key, err)
+	}
+
+	return out, nil
+}
+
+// pickFactorState finds the factor's entry in the core agent's factor states.
+func pickFactorState(states map[string]map[string]any, factorID string, factorIDs map[string]string) (map[string]any, error) {
+	factorKey, ok := resolveFactorKey(factorID, factorIDs)
+	if !ok {
+		return nil, fmt.Errorf("unknown factor %q", factorID)
 	}
 
 	for key, state := range states {
@@ -179,7 +209,12 @@ func pickFactorState(raw any, factorID string) (map[string]any, error) {
 // auditInstruction is the audit agent's InstructionProvider: the base instruction
 // followed by the findings (Output section) of the factor being audited.
 func auditInstruction(ctx agent.ReadonlyContext) (string, error) {
-	return auditInstructionFor(auditFactor(contentText(ctx.UserContent())))
+	factorIDs, err := readFactorIDs(ctx.ReadonlyState())
+	if err != nil {
+		return "", err
+	}
+
+	return auditInstructionFor(auditFactor(contentText(ctx.UserContent())), factorIDs)
 }
 
 // auditFactor extracts the factor from the audit node's input, which is an
@@ -193,9 +228,10 @@ func auditFactor(input string) string {
 	return strings.TrimSpace(input)
 }
 
-// auditInstructionFor builds the audit instruction for a factor.
-func auditInstructionFor(factorID string) (string, error) {
-	key, ok := resolveFactorKey(factorID)
+// auditInstructionFor builds the audit instruction for a factor. A factor that does not
+// resolve, or has no findings file, gets the default findings.
+func auditInstructionFor(factorID string, factorIDs map[string]string) (string, error) {
+	key, ok := resolveFactorKey(factorID, factorIDs)
 	if !ok {
 		key = defaultFindingsKey
 	}
@@ -226,42 +262,32 @@ func readArtifact(files embed.FS, key, kind string) (string, error) {
 // resolveFactorKey resolves a factor identifier to its factor ID (e.g. "dm2").
 // It handles a bare factor ID or ICD-10 code ("age", "E11.9") and the form
 // "<code>: <name>" (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
-// Only the part before the colon is used. It is tried as a known factor ID first,
-// then against the ICD-10 aliases, the longest matching prefix winning.
-// It reports false for an unknown factor.
-func resolveFactorKey(factorID string) (string, bool) {
+// Only the part before the colon is used. It is tried as a known factor ID first
+// (a default factor or a value of factorIDs), then as an ICD-10 code in factorIDs,
+// the mapping from the core agent. It reports false for an unknown factor.
+func resolveFactorKey(factorID string, factorIDs map[string]string) (string, bool) {
 	code, _, _ := strings.Cut(factorID, ":")
 	code = strings.ToLower(strings.TrimSpace(code))
-
-	if isFactorID(code) {
-		return code, true
+	if code == "" {
+		return "", false
 	}
 
-	var prefix string
-	for p := range icd10Aliases {
-		if strings.HasPrefix(code, p) && len(p) > len(prefix) {
-			prefix = p
+	for _, id := range defaultFactors {
+		if code == id {
+			return id, true
 		}
 	}
-	if prefix != "" {
-		return icd10Aliases[prefix], true
+	for _, id := range factorIDs {
+		if id = strings.ToLower(strings.TrimSpace(id)); code == id {
+			return id, true
+		}
+	}
+
+	for icd10, id := range factorIDs {
+		if strings.EqualFold(strings.TrimSpace(icd10), code) {
+			return strings.ToLower(strings.TrimSpace(id)), true
+		}
 	}
 
 	return "", false
-}
-
-// isFactorID reports whether id is a known factor ID: a default factor or an alias target.
-func isFactorID(id string) bool {
-	for _, f := range defaultFactors {
-		if id == f {
-			return true
-		}
-	}
-	for _, f := range icd10Aliases {
-		if id == f {
-			return true
-		}
-	}
-
-	return false
 }
