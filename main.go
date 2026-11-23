@@ -28,13 +28,18 @@ import (
 )
 
 func userText(ctx agent.InvocationContext) string {
-	if ctx.UserContent() == nil {
+	return contentText(ctx.UserContent())
+}
+
+// contentText concatenates the text parts of content.
+func contentText(content *genai.Content) string {
+	if content == nil {
 		return ""
 	}
 
 	var text strings.Builder
 
-	for _, part := range ctx.UserContent().Parts {
+	for _, part := range content.Parts {
 		if part != nil && part.Text != "" {
 			// No separator - follows what ADK does internally
 			text.WriteString(part.Text)
@@ -161,10 +166,13 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 }
 
 // defaultFactors are always audited, in addition to the medical factors found by the core agent.
-var defaultFactors = []string{"age", "bmi", "tobacco_use"}
+var defaultFactors = []string{"age", "bmi", "tobacco"}
 
 // factorsToAudit returns the core agent's medical factors (sorted by ICD-10 code)
-// followed by the default factors, skipping any default already present.
+// followed by the default factors. A factor is audited once: of several medical
+// factors resolving to the same factor ID (e.g. E11.9 and E11.65), only the first
+// is kept, and a default already covered by a medical factor is skipped.
+// Medical factors that do not resolve are kept as they are.
 func factorsToAudit(resp *CoreAgentResponse) []string {
 	var factors []string
 	seen := make(map[string]bool)
@@ -177,10 +185,14 @@ func factorsToAudit(resp *CoreAgentResponse) []string {
 		sort.Strings(icd10s)
 
 		for _, icd10 := range icd10s {
-			name := resp.MedicalFactors[icd10]
-			seen[strings.ToLower(icd10)] = true
-			seen[strings.ToLower(name)] = true
-			factors = append(factors, fmt.Sprintf("%s: %s", icd10, name))
+			if id, ok := resolveFactorKey(icd10); ok {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+			}
+
+			factors = append(factors, fmt.Sprintf("%s: %s", icd10, resp.MedicalFactors[icd10]))
 		}
 	}
 
@@ -191,6 +203,22 @@ func factorsToAudit(resp *CoreAgentResponse) []string {
 	}
 
 	return factors
+}
+
+// auditInputs pairs each factor to audit with the chat history it is audited against.
+func auditInputs(resp *CoreAgentResponse) []AuditInput {
+	var history []Turn
+	if resp != nil {
+		history = resp.History
+	}
+
+	factors := factorsToAudit(resp)
+	inputs := make([]AuditInput, 0, len(factors))
+	for _, factor := range factors {
+		inputs = append(inputs, AuditInput{Factor: factor, History: history})
+	}
+
+	return inputs
 }
 
 // gatherAudits decides the final reply once all factors are audited.
@@ -270,24 +298,23 @@ func run() error {
 		return fmt.Errorf("failed to create input_rules tool: %v", err)
 	}
 
-	AuditFindingsFormTool, err := functiontool.New(functiontool.Config{
-		Name:        "audit_findings_form",
-		Description: "Loads the audit findings form for medical factors.",
-	}, auditFindingsForm)
+	factorStateTool, err := functiontool.New(functiontool.Config{
+		Name:        "factor_state",
+		Description: "Returns the state the core agent recorded for a medical factor.",
+	}, newFactorStateTool(sessionFactorState))
 	if err != nil {
-		return fmt.Errorf("failed to create audit_findings_form tool: %v", err)
+		return fmt.Errorf("failed to create factor_state tool: %v", err)
 	}
 
 	auditAgent, err := llmagent.New(llmagent.Config{
 		Name:        "audit_agent",
 		Model:       llm,
 		Description: "Audits input interpretation of user input and ingestion into state.",
-		Instruction: "retrieve medical factor-specific input rules from ``input_rules`` tool to prepare information " +
-			"needed for auditing, load the audit findings form for the medical factors using ``audit_findings_form`` tool, " +
-			"fill out the form, and report whether the factor passed the audit with the reason and the filled-out form",
+		// Base instruction plus the factor's findings file as the Output section.
+		InstructionProvider: auditInstruction,
 		Tools: []tool.Tool{
 			inputRulesTool,
-			AuditFindingsFormTool,
+			factorStateTool,
 		},
 	})
 	if err != nil {
@@ -298,21 +325,21 @@ func run() error {
 	// default factors, and fans the result out across LLM calls.
 	splitFactors := workflow.NewFunctionNode(
 		"split_factors",
-		func(_ agent.Context, resp *CoreAgentResponse) ([]string, error) {
-			return factorsToAudit(resp), nil
+		func(_ agent.Context, resp *CoreAgentResponse) ([]AuditInput, error) {
+			return auditInputs(resp), nil
 		},
 		cfg,
 	)
 
 	// Audit LlmAgent wrapped in NewAgentNode -> MUST be listed in SubAgents
-	auditNode, err := workflow.NewAgentNodeTyped[string, AuditResult](auditAgent, cfg)
+	auditNode, err := workflow.NewAgentNodeTyped[AuditInput, AuditResult](auditAgent, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create audit node: %v", err)
 	}
 
 	const maxConcurrency = 2
 
-	// ParallelWorker: runs auditNodes concurrently across []string -> []string.
+	// ParallelWorker: runs auditNodes concurrently across []AuditInput -> []AuditResult.
 	// Cap maxConcurrency at 2 to stay within API rate limits.
 	parallelAuditors, err := workflow.NewParallelWorker(
 		"parallel_auditors",
