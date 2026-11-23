@@ -169,7 +169,10 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 var defaultFactors = []string{"age", "bmi", "tobacco"}
 
 // factorsToAudit returns the core agent's medical factors (sorted by ICD-10 code)
-// followed by the default factors, skipping any default already present.
+// followed by the default factors. A factor is audited once: of several medical
+// factors resolving to the same factor ID (e.g. E11.9 and E11.65), only the first
+// is kept, and a default already covered by a medical factor is skipped.
+// Medical factors that do not resolve are kept as they are.
 func factorsToAudit(resp *CoreAgentResponse) []string {
 	var factors []string
 	seen := make(map[string]bool)
@@ -182,10 +185,14 @@ func factorsToAudit(resp *CoreAgentResponse) []string {
 		sort.Strings(icd10s)
 
 		for _, icd10 := range icd10s {
-			name := resp.MedicalFactors[icd10]
-			seen[strings.ToLower(icd10)] = true
-			seen[strings.ToLower(name)] = true
-			factors = append(factors, fmt.Sprintf("%s: %s", icd10, name))
+			if id, ok := resolveFactorKey(icd10); ok {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+			}
+
+			factors = append(factors, fmt.Sprintf("%s: %s", icd10, resp.MedicalFactors[icd10]))
 		}
 	}
 

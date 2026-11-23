@@ -67,8 +67,45 @@ func TestPickFactorState(t *testing.T) {
 		t.Errorf("generic state = %v", got)
 	}
 
-	if got, _ := pickFactorState(typed, "bmi"); got != nil {
-		t.Errorf("unknown factor state = %v, want nil", got)
+	if _, err := pickFactorState(typed, "bmi"); err == nil {
+		t.Error("known factor without a state: want error")
+	}
+	if _, err := pickFactorState(typed, "I10: hypertension"); err == nil || !strings.Contains(err.Error(), "unknown factor") {
+		t.Errorf("unknown factor error = %v", err)
+	}
+}
+
+func TestResolveFactorKey(t *testing.T) {
+	for id, want := range map[string]string{
+		"dm2":                    "dm2",
+		" Age ":                  "age",
+		"tobacco":                "tobacco",
+		"E11.9: type 2 diabetes": "dm2",
+		"e11.65":                 "dm2",
+		"E11":                    "dm2",
+	} {
+		if got, ok := resolveFactorKey(id); !ok || got != want {
+			t.Errorf("resolveFactorKey(%q) = %q, %v; want %q", id, got, ok, want)
+		}
+	}
+
+	// Only the part before the colon counts.
+	for _, id := range []string{"I10: hypertension", "I10: dm2", "", "e1", "../x"} {
+		if got, ok := resolveFactorKey(id); ok {
+			t.Errorf("resolveFactorKey(%q) = %q, want unresolved", id, got)
+		}
+	}
+}
+
+func TestInputRulesUnknownFactor(t *testing.T) {
+	if _, err := inputRules(nil, FactorArgs{Factor: "I10: hypertension"}); err == nil {
+		t.Error("unknown factor: want error")
+	}
+
+	// A known factor without authored rules is not an error.
+	rules, err := inputRules(nil, FactorArgs{Factor: "age"})
+	if err != nil || rules.Content != "" {
+		t.Errorf("age rules = %+v, %v", rules, err)
 	}
 }
 

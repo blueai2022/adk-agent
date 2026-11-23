@@ -20,12 +20,13 @@ var inputRulesDocs embed.FS
 // defaultFindingsKey names the findings file used for factors without their own.
 const defaultFindingsKey = "default"
 
-// factorKeys maps known factor identifiers (ICD-10 code, factor id) to the factor
-// key that names its artifact files (artifacts/<key>-input-rules.md,
-// artifacts/<key>-audit-findings.md) and its entry in the core agent's factor states.
-var factorKeys = map[string]string{
-	"e11.9": "dm2",
-	"dm2":   "dm2",
+// icd10Aliases maps lowercase ICD-10 code prefixes (e.g. "e11" covers "e11.9" and
+// "e11.65") to the factor ID of the factor they belong to. A factor ID names the
+// factor's artifact files (artifacts/<id>-input-rules.md, artifacts/<id>-audit-findings.md)
+// and its entry in the core agent's factor states. Besides the alias targets, the
+// default factors are known factor IDs.
+var icd10Aliases = map[string]string{
+	"e11": "dm2",
 }
 
 // auditBaseInstruction is the factor-independent part of the audit agent's instruction.
@@ -96,9 +97,7 @@ func inputRules(_ agent.Context, args FactorArgs) (InputRules, error) {
 
 	key, ok := resolveFactorKey(factorICD10)
 	if !ok {
-		rules.Description += " (no input rules authored yet for this factor)"
-
-		return rules, nil
+		return InputRules{}, fmt.Errorf("unknown factor %q", factorICD10)
 	}
 
 	content, err := readArtifact(inputRulesDocs, key, "input-rules")
@@ -152,6 +151,11 @@ func sessionFactorState(ctx agent.Context, factorID string) (map[string]any, err
 
 // pickFactorState finds the factor's entry in the core agent's factor states.
 func pickFactorState(raw any, factorID string) (map[string]any, error) {
+	factorKey, ok := resolveFactorKey(factorID)
+	if !ok {
+		return nil, fmt.Errorf("unknown factor %q", factorID)
+	}
+
 	// The stored value may be typed or, after a state round trip, generic JSON.
 	data, err := json.Marshal(raw)
 	if err != nil {
@@ -163,11 +167,9 @@ func pickFactorState(raw any, factorID string) (map[string]any, error) {
 		return nil, fmt.Errorf("core:factor_states has an unexpected shape: %w", err)
 	}
 
-	for _, candidate := range factorKeyCandidates(factorID) {
-		for key, state := range states {
-			if strings.EqualFold(key, candidate) {
-				return state, nil
-			}
+	for key, state := range states {
+		if strings.EqualFold(key, factorKey) {
+			return state, nil
 		}
 	}
 
@@ -221,34 +223,45 @@ func readArtifact(files embed.FS, key, kind string) (string, error) {
 	return string(content), nil
 }
 
-// factorKeyCandidates lists the lowercase identifiers a factor may be known by.
-// It handles factor identifiers of the form "<code>: <name>"
-// (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
-// The mapped factor key, if any, comes first.
-func factorKeyCandidates(factorID string) []string {
-	var candidates []string
-	if key, ok := resolveFactorKey(factorID); ok {
-		candidates = append(candidates, key)
-	}
-
-	for _, part := range strings.SplitN(factorID, ":", 2) {
-		if key := strings.ToLower(strings.TrimSpace(part)); key != "" {
-			candidates = append(candidates, key)
-		}
-	}
-
-	return candidates
-}
-
-// resolveFactorKey resolves a factor identifier to its factor key.
-// It handles factor identifiers of the form "<code>: <name>"
-// (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
+// resolveFactorKey resolves a factor identifier to its factor ID (e.g. "dm2").
+// It handles a bare factor ID or ICD-10 code ("age", "E11.9") and the form
+// "<code>: <name>" (e.g. "E11.9: type 2 diabetes"), as produced by factorsToAudit.
+// Only the part before the colon is used. It is tried as a known factor ID first,
+// then against the ICD-10 aliases, the longest matching prefix winning.
+// It reports false for an unknown factor.
 func resolveFactorKey(factorID string) (string, bool) {
-	for _, part := range strings.SplitN(factorID, ":", 2) {
-		if key, ok := factorKeys[strings.ToLower(strings.TrimSpace(part))]; ok {
-			return key, true
+	code, _, _ := strings.Cut(factorID, ":")
+	code = strings.ToLower(strings.TrimSpace(code))
+
+	if isFactorID(code) {
+		return code, true
+	}
+
+	var prefix string
+	for p := range icd10Aliases {
+		if strings.HasPrefix(code, p) && len(p) > len(prefix) {
+			prefix = p
 		}
+	}
+	if prefix != "" {
+		return icd10Aliases[prefix], true
 	}
 
 	return "", false
+}
+
+// isFactorID reports whether id is a known factor ID: a default factor or an alias target.
+func isFactorID(id string) bool {
+	for _, f := range defaultFactors {
+		if id == f {
+			return true
+		}
+	}
+	for _, f := range icd10Aliases {
+		if id == f {
+			return true
+		}
+	}
+
+	return false
 }
