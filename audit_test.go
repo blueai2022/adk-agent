@@ -21,12 +21,12 @@ func TestAuditInstructionFor(t *testing.T) {
 		t.Errorf("E11.9 instruction lacks the DM2 findings: %q", dm2)
 	}
 
-	other, err := auditInstructionFor("tobacco_use")
+	other, err := auditInstructionFor("tobacco")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(other, auditBaseInstruction) || strings.Contains(other, "`a1c`") {
-		t.Errorf("tobacco_use instruction should use the default findings: %q", other)
+		t.Errorf("tobacco instruction should use the default findings: %q", other)
 	}
 }
 

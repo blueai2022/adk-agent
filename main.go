@@ -166,7 +166,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 }
 
 // defaultFactors are always audited, in addition to the medical factors found by the core agent.
-var defaultFactors = []string{"age", "bmi", "tobacco_use"}
+var defaultFactors = []string{"age", "bmi", "tobacco"}
 
 // factorsToAudit returns the core agent's medical factors (sorted by ICD-10 code)
 // followed by the default factors, skipping any default already present.

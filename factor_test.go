@@ -18,7 +18,7 @@ func TestFactorsToAudit(t *testing.T) {
 		"F17: BMI",
 		"I10: hypertension",
 		"age",
-		"tobacco_use",
+		"tobacco",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("factorsToAudit() = %v, want %v", got, want)

@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"google.golang.org/adk/v2/agent"
-	"google.golang.org/adk/v2/session"
 )
 
 //go:embed artifacts/*-audit-findings.md
@@ -144,11 +143,8 @@ func newFactorStateTool(stateFn FactorStateFunc) func(agent.Context, FactorArgs)
 func sessionFactorState(ctx agent.Context, factorID string) (map[string]any, error) {
 	raw, err := ctx.State().Get("core:factor_states")
 	if err != nil {
-		if errors.Is(err, session.ErrStateKeyNotExist) {
-			return nil, nil
-		}
-
-		return nil, err
+		// The core sub-agent always stores factor states, so a missing key is a wiring bug.
+		return nil, fmt.Errorf("read core:factor_states: %w", err)
 	}
 
 	return pickFactorState(raw, factorID)
@@ -175,7 +171,7 @@ func pickFactorState(raw any, factorID string) (map[string]any, error) {
 		}
 	}
 
-	return nil, nil
+	return nil, fmt.Errorf("core agent has no state for factor %q", factorID)
 }
 
 // auditInstruction is the audit agent's InstructionProvider: the base instruction
