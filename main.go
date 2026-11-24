@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 
@@ -86,11 +87,26 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 					return
 				}
 
+				state := ctx.Session().State()
+
+				// The core agent mints its session ID on the first turn, so none is stored yet.
+				sessionID, err := coreSessionID(state)
+				if err != nil && !errors.Is(err, session.ErrStateKeyNotExist) {
+					yield(nil, err)
+
+					return
+				}
+
 				// Build an agent.Context from the InvocationContext
 				agentCtx := agent.NewCallbackContext(ctx, nil)
-				resp, err := client.SendTurn(agentCtx, userInput)
+				resp, err := client.SendTurn(agentCtx, sessionID, userInput)
 				if err != nil {
 					yield(nil, fmt.Errorf("core_underwriting_agent SendTurn failed: %w", err))
+
+					return
+				}
+				if resp == nil || resp.SessionID == "" {
+					yield(nil, fmt.Errorf("core_underwriting_agent: core agent returned no session ID"))
 
 					return
 				}
@@ -104,7 +120,11 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 					return
 				}
 
-				state := ctx.Session().State()
+				if err := state.Set(coreSessionIDKey, resp.SessionID); err != nil {
+					yield(nil, err)
+
+					return
+				}
 				if err := state.Set("core:medical_factors", resp.MedicalFactors); err != nil {
 					yield(nil, err)
 
@@ -226,6 +246,20 @@ func auditInputs(resp *CoreAgentResponse) []AuditInput {
 	return inputs
 }
 
+// coreSessionIDKey is the session state key of the core agent's own session ID.
+const coreSessionIDKey = "core:session_id"
+
+// coreSessionID reads the core agent's session ID from state. It returns
+// session.ErrStateKeyNotExist (wrapped) before the core agent has replied.
+func coreSessionID(state session.ReadonlyState) (string, error) {
+	id, err := readState[string](state, coreSessionIDKey)
+	if err != nil {
+		return "", err
+	}
+
+	return id, nil
+}
+
 // gatherAudits decides the final reply once all factors are audited.
 func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResult) (string, error) {
 	var failed []AuditResult
@@ -236,7 +270,13 @@ func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResu
 	}
 
 	if len(failed) > 0 {
-		if err := client.ReportAuditFailure(ctx, failed); err != nil {
+		// Audits only run after the core agent has replied, so its session ID must be stored.
+		sessionID, err := coreSessionID(ctx.State())
+		if err != nil {
+			return "", fmt.Errorf("report audit failure to core agent: %w", err)
+		}
+
+		if err := client.ReportAuditFailure(ctx, sessionID, failed); err != nil {
 			return "", fmt.Errorf("report audit failure to core agent: %w", err)
 		}
 
