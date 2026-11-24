@@ -99,6 +99,21 @@ func (s fakeState) All() iter.Seq2[string, any] {
 	}
 }
 
+func TestCoreSessionID(t *testing.T) {
+	// Before the core agent has replied the key is absent, which callers can detect.
+	if _, err := coreSessionID(fakeState{}); !errors.Is(err, session.ErrStateKeyNotExist) {
+		t.Errorf("missing session ID error = %v, want ErrStateKeyNotExist", err)
+	}
+
+	if got, err := coreSessionID(fakeState{coreSessionIDKey: "abc"}); err != nil || got != "abc" {
+		t.Errorf("coreSessionID() = %q, %v", got, err)
+	}
+
+	if _, err := coreSessionID(fakeState{coreSessionIDKey: 42}); err == nil || errors.Is(err, session.ErrStateKeyNotExist) {
+		t.Errorf("non-string session ID error = %v, want a shape error", err)
+	}
+}
+
 func TestReadFactorIDs(t *testing.T) {
 	// Typed, and generic JSON as after a state round trip.
 	for name, stored := range map[string]any{
