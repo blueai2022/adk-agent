@@ -171,20 +171,34 @@ func readFactorIDs(state session.ReadonlyState) (map[string]string, error) {
 // readState reads key from session state as a T. The stored value may be typed or,
 // after a state round trip, generic JSON.
 func readState[T any](state session.ReadonlyState, key string) (T, error) {
-	var out T
-
 	raw, err := state.Get(key)
 	if err != nil {
+		var out T
+
 		return out, fmt.Errorf("read %s: %w", key, err)
 	}
 
-	data, err := json.Marshal(raw)
+	out, err := decodeAny[T](raw)
+	if err != nil {
+		return out, fmt.Errorf("%s has an unexpected shape: %w", key, err)
+	}
+
+	return out, nil
+}
+
+// decodeAny converts v - which may already be a T, or the generic map/slice shape
+// JSON produces after a state or workflow JoinNode round trip - into a T, via a
+// JSON marshal/unmarshal round trip.
+func decodeAny[T any](v any) (T, error) {
+	var out T
+
+	data, err := json.Marshal(v)
 	if err != nil {
 		return out, err
 	}
 
 	if err := json.Unmarshal(data, &out); err != nil {
-		return out, fmt.Errorf("%s has an unexpected shape: %w", key, err)
+		return out, err
 	}
 
 	return out, nil
