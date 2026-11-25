@@ -42,9 +42,8 @@ func medicalAuditInput(resp *CoreAgentResponse) MedicalAuditInput {
 }
 
 // newMedicalAuditAgent builds the global medical audit LLM agent. Unlike the
-// per-factor audit_agent, it reviews the whole chat once per turn for blind spots
-// that span the conversation rather than one factor: overwhelming medical
-// information, medical research content, and over-detected trivial conditions.
+// per-factor audit_agent, it reviews the whole chat once per turn for blind spots: 
+// over-detected trivial conditions with no mortality implications for underwriting.
 func newMedicalAuditAgent(llm model.LLM) (agent.Agent, error) {
 	findings, err := readArtifact(findingsForms, "medical", "audit-findings")
 	if err != nil {
@@ -54,7 +53,7 @@ func newMedicalAuditAgent(llm model.LLM) (agent.Agent, error) {
 	return llmagent.New(llmagent.Config{
 		Name:        medicalAuditAgentName,
 		Model:       llm,
-		Description: "Audits the whole chat for overwhelming medical information, medical research content, and over-detected trivial conditions.",
+		Description: "Audits the detected medical factors for over-detected trivial conditions with no mortality implications for underwriting.",
 		Instruction: medicalAuditBaseInstruction + findings,
 	})
 }
