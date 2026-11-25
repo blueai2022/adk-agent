@@ -53,9 +53,20 @@ func contentText(content *genai.Content) string {
 // routeRating routes the core agent's output to the audit branch of the workflow.
 const routeRating = "rating"
 
-// auditFailureMessage is sent to the user when any factor fails its audit.
+// auditFailureMessage is sent to the user when any factor, or a non-security-risk
+// global check, fails its audit.
 const auditFailureMessage = "We could not complete the automated review of your application, " +
 	"so it is being sent to a human underwriter for review."
+
+// securityRiskMessage is sent to the user instead of auditFailureMessage when the
+// global medical audit flags a security risk (overwhelming medical info or
+// medical research).
+const securityRiskMessage = "The agent has detected an anomaly which triggered a security alert " +
+	"to protect itself. The chat session is now under human review. We apologize for the inconvenience."
+
+// parallelAuditorsNodeName is the ParallelWorker's node name, and so the JoinNode
+// predecessor key gatherAudits reads the per-factor audit results from.
+const parallelAuditorsNodeName = "parallel_auditors"
 
 // responseOutput converts the response into a JSON-like map. Agent nodes validate
 // their output against a schema, which cannot be done against a struct.
@@ -260,39 +271,79 @@ func coreSessionID(state session.ReadonlyState) (string, error) {
 	return id, nil
 }
 
-// gatherAudits decides the final reply once all factors are audited.
-func gatherAudits(ctx agent.Context, client CoreAgentClient, results []AuditResult) (string, error) {
-	var failed []AuditResult
+// auditOutcome decodes the JoinNode's output - a map keyed by predecessor node
+// name, holding the []AuditResult from parallelAuditorsNodeName and the
+// MedicalAuditResult from medicalAuditAgentName - into the failure to report and
+// the message to send the user. A nil failure means every factor and the global
+// medical audit passed, and the caller should reply with the core agent's own
+// response instead of message.
+func auditOutcome(joined map[string]any) (failure *AuditFailure, message string, err error) {
+	results, err := decodeAny[[]AuditResult](joined[parallelAuditorsNodeName])
+	if err != nil {
+		return nil, "", fmt.Errorf("decode factor audit results: %w", err)
+	}
+
+	global, err := decodeAny[MedicalAuditResult](joined[medicalAuditAgentName])
+	if err != nil {
+		return nil, "", fmt.Errorf("decode medical audit result: %w", err)
+	}
+
+	var failedFactors []AuditResult
 	for _, r := range results {
 		if !r.Passed {
-			failed = append(failed, r)
+			failedFactors = append(failedFactors, r)
 		}
 	}
 
-	if len(failed) > 0 {
-		// Audits only run after the core agent has replied, so its session ID must be stored.
-		sessionID, err := coreSessionID(ctx.State())
-		if err != nil {
-			return "", fmt.Errorf("report audit failure to core agent: %w", err)
-		}
-
-		if err := client.ReportAuditFailure(ctx, sessionID, failed); err != nil {
-			return "", fmt.Errorf("report audit failure to core agent: %w", err)
-		}
-
-		return auditFailureMessage, nil
+	if len(failedFactors) == 0 && global.Passed {
+		return nil, "", nil
 	}
 
-	reply, err := ctx.State().Get("core:user_response")
+	failure = &AuditFailure{FactorResults: failedFactors}
+	if !global.Passed {
+		failure.Global = &global
+	}
+
+	message = auditFailureMessage
+	if global.SecurityRisk {
+		message = securityRiskMessage
+	}
+
+	return failure, message, nil
+}
+
+// gatherAudits decides the final reply once both the per-factor audits and the
+// global medical audit have completed. See auditOutcome for how joined is read.
+func gatherAudits(ctx agent.Context, client CoreAgentClient, joined map[string]any) (string, error) {
+	failure, message, err := auditOutcome(joined)
 	if err != nil {
-		return "", fmt.Errorf("read core agent response: %w", err)
+		return "", err
 	}
 
-	if text, ok := reply.(string); ok {
-		return text, nil
+	if failure == nil {
+		reply, err := ctx.State().Get("core:user_response")
+		if err != nil {
+			return "", fmt.Errorf("read core agent response: %w", err)
+		}
+
+		if text, ok := reply.(string); ok {
+			return text, nil
+		}
+
+		return "", fmt.Errorf("core agent response is not a string")
 	}
 
-	return "", fmt.Errorf("core agent response is not a string")
+	// Audits only run after the core agent has replied, so its session ID must be stored.
+	sessionID, err := coreSessionID(ctx.State())
+	if err != nil {
+		return "", fmt.Errorf("report audit failure to core agent: %w", err)
+	}
+
+	if err := client.ReportAuditFailure(ctx, sessionID, *failure); err != nil {
+		return "", fmt.Errorf("report audit failure to core agent: %w", err)
+	}
+
+	return message, nil
 }
 
 func main() {
@@ -387,7 +438,7 @@ func run() error {
 	// ParallelWorker: runs auditNodes concurrently across []AuditInput -> []AuditResult.
 	// Cap maxConcurrency at 2 to stay within API rate limits.
 	parallelAuditors, err := workflow.NewParallelWorker(
-		"parallel_auditors",
+		parallelAuditorsNodeName,
 		auditNode,
 		maxConcurrency,
 		cfg,
@@ -396,27 +447,68 @@ func run() error {
 		return fmt.Errorf("failed to create ParallelWorker: %v", err)
 	}
 
-	// Gather node: passes the core agent's original reply to the user if every factor
-	// passed the audit; otherwise reports the failure to the core agent and the user.
-	gatherAudits := workflow.NewEmittingFunctionNode(
-		"gather_audits",
-		func(ctx agent.Context, results []AuditResult, _ func(*session.Event) error) (string, error) {
-			return gatherAudits(ctx, coreClient, results)
+	medicalAuditAgent, err := newMedicalAuditAgent(llm)
+	if err != nil {
+		return fmt.Errorf("failed to create medical audit agent: %v", err)
+	}
+
+	// Producer node: extracts the global medical audit agent's input (the detected
+	// medical factors and the chat) from the core agent's response.
+	buildMedicalAuditInput := workflow.NewFunctionNode(
+		"medical_audit_input",
+		func(_ agent.Context, resp *CoreAgentResponse) (MedicalAuditInput, error) {
+			return medicalAuditInput(resp), nil
 		},
 		cfg,
 	)
 
-	// Root workflowagent
+	medicalAuditNode, err := workflow.NewAgentNodeTyped[MedicalAuditInput, MedicalAuditResult](medicalAuditAgent, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create medical audit node: %v", err)
+	}
+
+	// Fan-in barrier: waits for both the per-factor audits and the global medical
+	// audit before gatherAudits decides the final reply.
+	auditJoin := workflow.NewJoinNode("audit_join")
+
+	// Gather node: passes the core agent's original reply to the user if every factor
+	// and the global medical audit passed; otherwise reports the failure to the core
+	// agent and the user.
+	gatherAuditsNode := workflow.NewEmittingFunctionNode(
+		"gather_audits",
+		func(ctx agent.Context, joined map[string]any, _ func(*session.Event) error) (string, error) {
+			return gatherAudits(ctx, coreClient, joined)
+		},
+		cfg,
+	)
+
+	// Root workflowagent. Graph wiring (only the rating stage is audited; other
+	// stages are already answered by coreAgentNode and never reach this fan-out):
+	//
+	//   START ─> coreAgentNode ──rating─┬─> splitFactors ──────────> parallelAuditors ──┐
+	//                                   └─> buildMedicalAuditInput ─> medicalAuditNode ──┼─> auditJoin ─> gatherAuditsNode
+	edgeBuilder := workflow.NewEdgeBuilder()
+	edgeBuilder.Add(workflow.Start, coreAgentNode)
+	edgeBuilder.AddRoute(
+		coreAgentNode,
+		splitFactors,
+		workflow.StringRoute(routeRating),
+	)
+	edgeBuilder.AddRoute(
+		coreAgentNode,
+		buildMedicalAuditInput,
+		workflow.StringRoute(routeRating),
+	)
+	edgeBuilder.Add(splitFactors, parallelAuditors)
+	edgeBuilder.Add(buildMedicalAuditInput, medicalAuditNode)
+	edgeBuilder.AddFanIn(auditJoin, parallelAuditors, medicalAuditNode)
+	edgeBuilder.Add(auditJoin, gatherAuditsNode)
+
 	rootAgent, err := workflowagent.New(workflowagent.Config{
 		Name:        "root_underwriting_workflow",
 		Description: "Runs external core HTTP agent followed by audit agents.",
-		SubAgents:   []agent.Agent{coreSubAgent, auditAgent},
-		// Only the rating stage is audited; other stages are already answered by the core agent.
-		Edges: workflow.Concat(
-			workflow.Chain(workflow.Start, coreAgentNode),
-			[]workflow.Edge{{From: coreAgentNode, To: splitFactors, Route: workflow.StringRoute(routeRating)}},
-			workflow.Chain(splitFactors, parallelAuditors, gatherAudits),
-		),
+		SubAgents:   []agent.Agent{coreSubAgent, auditAgent, medicalAuditAgent},
+		Edges:       edgeBuilder.Build(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create root agent: %v", err)

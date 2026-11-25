@@ -40,14 +40,22 @@ func (c *coreAgentClient) SendTurn(ctx context.Context, sessionID, userInput str
 	return nil, nil
 }
 
-func (c *coreAgentClient) ReportAuditFailure(ctx context.Context, sessionID string, failed []AuditResult) error {
+func (c *coreAgentClient) ReportAuditFailure(ctx context.Context, sessionID string, failure AuditFailure) error {
 	return nil
 }
 
 type CoreAgentClient interface {
 	SendTurn(ctx context.Context, sessionID, userInput string) (*CoreAgentResponse, error)
-	// ReportAuditFailure tells the core agent which factors failed the audit.
-	ReportAuditFailure(ctx context.Context, sessionID string, failed []AuditResult) error
+	// ReportAuditFailure tells the core agent which factors and/or global checks failed the audit.
+	ReportAuditFailure(ctx context.Context, sessionID string, failure AuditFailure) error
+}
+
+// AuditFailure bundles the audit outcomes reported back to the core agent: the
+// per-factor disagreements (if any) and the global medical audit result, set only
+// when the global audit itself disagreed with the core agent.
+type AuditFailure struct {
+	FactorResults []AuditResult       `json:"factor_results"`
+	Global        *MedicalAuditResult `json:"global,omitempty"`
 }
 
 func NewCoreAgentClient() (CoreAgentClient, error) {

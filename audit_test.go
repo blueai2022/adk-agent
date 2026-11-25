@@ -201,6 +201,67 @@ func TestAuditToolsAndAgentWiring(t *testing.T) {
 	}
 }
 
+func TestAuditOutcome(t *testing.T) {
+	passingResults := []AuditResult{{Factor: "age", Passed: true}, {Factor: "bmi", Passed: true}}
+	failingResults := []AuditResult{{Factor: "age", Passed: true}, {Factor: "dm2", Passed: false, Reason: "no a1c in chat"}}
+
+	joined := func(results []AuditResult, global MedicalAuditResult) map[string]any {
+		return map[string]any{
+			parallelAuditorsNodeName: results,
+			medicalAuditAgentName:    global,
+		}
+	}
+
+	// Everything passes: no failure, caller falls back to the core agent's reply.
+	if failure, message, err := auditOutcome(joined(passingResults, MedicalAuditResult{Passed: true})); err != nil || failure != nil || message != "" {
+		t.Errorf("all passed: failure=%v message=%q err=%v", failure, message, err)
+	}
+
+	// A failed factor alone: reported, generic message, no Global on the failure.
+	failure, message, err := auditOutcome(joined(failingResults, MedicalAuditResult{Passed: true}))
+	if err != nil || failure == nil || len(failure.FactorResults) != 1 || failure.FactorResults[0].Factor != "dm2" ||
+		failure.Global != nil || message != auditFailureMessage {
+		t.Errorf("factor failure: failure=%+v message=%q err=%v", failure, message, err)
+	}
+
+	// A non-security global failure (e.g. trivial_condition): reported with Global set, generic message.
+	trivial := MedicalAuditResult{Passed: false, Findings: []Finding{{Level: GlobalLevel, ReasonType: ReasonTrivialCondition}}}
+	failure, message, err = auditOutcome(joined(passingResults, trivial))
+	if err != nil || failure == nil || len(failure.FactorResults) != 0 || failure.Global == nil ||
+		failure.Global.Passed || message != auditFailureMessage {
+		t.Errorf("trivial condition failure: failure=%+v message=%q err=%v", failure, message, err)
+	}
+
+	// A security-risk global failure (overwhelming info / medical research): distinct message.
+	risky := MedicalAuditResult{Passed: false, SecurityRisk: true, Findings: []Finding{{Level: GlobalLevel, ReasonType: ReasonOverwhelmingInfo}}}
+	if failure, message, err = auditOutcome(joined(passingResults, risky)); err != nil || failure == nil ||
+		failure.Global == nil || !failure.Global.SecurityRisk || message != securityRiskMessage {
+		t.Errorf("security risk failure: failure=%+v message=%q err=%v", failure, message, err)
+	}
+
+	// Both a failed factor and a security risk: both carried, the security message wins.
+	if failure, message, err = auditOutcome(joined(failingResults, risky)); err != nil || failure == nil ||
+		len(failure.FactorResults) != 1 || failure.Global == nil || message != securityRiskMessage {
+		t.Errorf("combined failure: failure=%+v message=%q err=%v", failure, message, err)
+	}
+}
+
+func TestAuditOutcomeDecodeError(t *testing.T) {
+	// An undecodable shape at either key is an error, not a silent pass.
+	if _, _, err := auditOutcome(map[string]any{
+		parallelAuditorsNodeName: "not a list",
+		medicalAuditAgentName:    MedicalAuditResult{Passed: true},
+	}); err == nil {
+		t.Error("undecodable factor results: want error")
+	}
+	if _, _, err := auditOutcome(map[string]any{
+		parallelAuditorsNodeName: []AuditResult{},
+		medicalAuditAgentName:    "not a result",
+	}); err == nil {
+		t.Error("undecodable global result: want error")
+	}
+}
+
 func TestAuditInputsCarryHistory(t *testing.T) {
 	resp := &CoreAgentResponse{
 		MedicalFactors: map[string]string{"E11.9": "type 2 diabetes"},
