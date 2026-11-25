@@ -46,9 +46,12 @@ func TestMedicalAuditFindingsArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"overwhelming_medical_info", "medical_research", "trivial_condition"} {
-		if !strings.Contains(findings, want) {
-			t.Errorf("medical audit findings missing %q", want)
+	if !strings.Contains(findings, "trivial_condition") {
+		t.Error("medical audit findings missing \"trivial_condition\"")
+	}
+	for _, unwanted := range []string{"overwhelming_medical_info", "medical_research"} {
+		if strings.Contains(findings, unwanted) {
+			t.Errorf("medical audit findings should not cover %q (now medical_safety_agent's job)", unwanted)
 		}
 	}
 }

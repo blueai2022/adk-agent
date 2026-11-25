@@ -386,6 +386,28 @@ func run() error {
 		return fmt.Errorf("failed to create core agent node: %v", err)
 	}
 
+	medicalSafetyAgent, err := newMedicalSafetyAgent(llm)
+	if err != nil {
+		return fmt.Errorf("failed to create medical safety agent: %v", err)
+	}
+
+	// Entry node: appends to main:history and decides if the medical safety LLM
+	// check is required.
+	safetyGateCheckNode := workflow.NewEmittingFunctionNode(
+		"safety_gate_check", safetyGateCheck, cfg,
+	)
+
+	medicalSafetyNode, err := workflow.
+		NewAgentNodeTyped[MedicalSafetyInput, MedicalAuditResult](medicalSafetyAgent, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create medical safety node: %v", err)
+	}
+
+	// Follows medicalSafetyNode: ends the turn with securityRiskMessage, or
+	// passes the turn through to the core agent unchanged.
+	medicalSafetyGateNode := workflow.
+		NewEmittingFunctionNode("medical_safety_gate", medicalSafetyGate, cfg)
+
 	inputRulesTool, err := functiontool.New(functiontool.Config{
 		Name:        "input_rules",
 		Description: "Extracts medical factor-specific input rules.",
@@ -462,7 +484,8 @@ func run() error {
 		cfg,
 	)
 
-	medicalAuditNode, err := workflow.NewAgentNodeTyped[MedicalAuditInput, MedicalAuditResult](medicalAuditAgent, cfg)
+	medicalAuditNode, err := workflow.
+		NewAgentNodeTyped[MedicalAuditInput, MedicalAuditResult](medicalAuditAgent, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create medical audit node: %v", err)
 	}
@@ -476,19 +499,44 @@ func run() error {
 	// agent and the user.
 	gatherAuditsNode := workflow.NewEmittingFunctionNode(
 		"gather_audits",
-		func(ctx agent.Context, joined map[string]any, _ func(*session.Event) error) (string, error) {
+		func(
+			ctx agent.Context,
+			joined map[string]any,
+			_ func(*session.Event) error,
+		) (string, error) {
 			return gatherAudits(ctx, coreClient, joined)
 		},
 		cfg,
 	)
 
 	// Root workflowagent. Graph wiring (only the rating stage is audited; other
-	// stages are already answered by coreAgentNode and never reach this fan-out):
+	// stages are already answered by coreAgentNode and never reach the audit
+	// fan-out; the medical safety check runs in front of the core agent, on
+	// every turn, independently of stage):
 	//
-	//   START ─> coreAgentNode ──rating─┬─> splitFactors ──────────> parallelAuditors ──┐
-	//                                   └─> buildMedicalAuditInput ─> medicalAuditNode ──┼─> auditJoin ─> gatherAuditsNode
+	//   START ─> safetyGateCheckNode ──safety_check─> medicalSafetyNode ─> medicalSafetyGateNode ──┐
+	//                               └──continue───────────────────────────────────────────────────┼─> coreAgentNode
+	//                                                                                                     │
+	//                                                                               ┌──rating─> splitFactors ──────────> parallelAuditors ──┐
+	//                                                                               └──rating─> buildMedicalAuditInput ─> medicalAuditNode ──┼─> auditJoin ─> gatherAuditsNode
 	edgeBuilder := workflow.NewEdgeBuilder()
-	edgeBuilder.Add(workflow.Start, coreAgentNode)
+	edgeBuilder.Add(workflow.Start, safetyGateCheckNode)
+	edgeBuilder.AddRoute(
+		safetyGateCheckNode,
+		medicalSafetyNode,
+		workflow.StringRoute(routeSafetyCheck),
+	)
+	edgeBuilder.AddRoute(
+		safetyGateCheckNode,
+		coreAgentNode,
+		workflow.StringRoute(routeContinue),
+	)
+	edgeBuilder.Add(medicalSafetyNode, medicalSafetyGateNode)
+	edgeBuilder.AddRoute(
+		medicalSafetyGateNode,
+		coreAgentNode,
+		workflow.StringRoute(routeContinue),
+	)
 	edgeBuilder.AddRoute(
 		coreAgentNode,
 		splitFactors,
@@ -507,8 +555,10 @@ func run() error {
 	rootAgent, err := workflowagent.New(workflowagent.Config{
 		Name:        "root_underwriting_workflow",
 		Description: "Runs external core HTTP agent followed by audit agents.",
-		SubAgents:   []agent.Agent{coreSubAgent, auditAgent, medicalAuditAgent},
-		Edges:       edgeBuilder.Build(),
+		SubAgents: []agent.Agent{
+			coreSubAgent, auditAgent, medicalAuditAgent, medicalSafetyAgent,
+		},
+		Edges: edgeBuilder.Build(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create root agent: %v", err)
