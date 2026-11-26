@@ -20,8 +20,9 @@ const (
 	// 2. Maps out treatment relationship between medications and disclosed medical conditions
 	// 3. Uses the condition list from returned ICD10 codes from core agent as it reflects the
 	// handling of unmapped signals by the core agent.
-	// 4. Compile unexplained medications. Note: this excludes medications that are known to treat
-	// common trivial conditions.
+	// 4. Compile unexplained/unmapped medications, i.e. taking medication without a corresponding
+	// diagnosis or clear cause by the user. Note: this excludes medications that are
+	// known to treat common trivial conditions.
 	// 5. Note if any questions about the unexplained medications have been asked.
 	// 6. Agent then adds a turn to ask follow-up questions for All the unexplained medications, excluding
 	// any medications for which follow-up had already been asked in the full chat history, by the
