@@ -107,5 +107,5 @@ func (f Finding) IsFactorLevel() bool {
 type MedicalAuditResult struct {
 	Passed       bool      `json:"passed"`        // true when none of the blind spots below apply
 	SecurityRisk bool      `json:"security_risk"` // true for overwhelming medical info or medical research; never for trivial_condition alone
-	Findings     []Finding `json:"findings"`      // failed finding: one entry per blind spot found
+	Findings     []Finding `json:"findings"`      // audit failed finding: one entry per blind spot found
 }
