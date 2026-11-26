@@ -207,8 +207,8 @@ func TestAuditOutcome(t *testing.T) {
 
 	joined := func(results []AuditResult, global MedicalAuditResult) map[string]any {
 		return map[string]any{
-			parallelAuditorsNodeName: results,
-			medicalAuditAgentName:    global,
+			parallelAuditorsNodeName:   results,
+			medicalAuditResultNodeName: global,
 		}
 	}
 
@@ -225,7 +225,7 @@ func TestAuditOutcome(t *testing.T) {
 	}
 
 	// A non-security global failure (e.g. trivial_condition): reported with Global set, generic message.
-	trivial := MedicalAuditResult{Passed: false, Findings: []Finding{{Level: GlobalLevel, ReasonType: ReasonTrivialCondition}}}
+	trivial := MedicalAuditResult{Passed: false, Findings: []Finding{{Factor: "J00", ReasonType: ReasonTrivialCondition}}}
 	failure, message, err = auditOutcome(joined(passingResults, trivial))
 	if err != nil || failure == nil || len(failure.FactorResults) != 0 || failure.Global == nil ||
 		failure.Global.Passed || message != auditFailureMessage {
@@ -233,7 +233,7 @@ func TestAuditOutcome(t *testing.T) {
 	}
 
 	// A security-risk global failure (overwhelming info / medical research): distinct message.
-	risky := MedicalAuditResult{Passed: false, SecurityRisk: true, Findings: []Finding{{Level: GlobalLevel, ReasonType: ReasonOverwhelmingInfo}}}
+	risky := MedicalAuditResult{Passed: false, SecurityRisk: true, Findings: []Finding{{ReasonType: ReasonOverwhelmingInfo}}}
 	if failure, message, err = auditOutcome(joined(passingResults, risky)); err != nil || failure == nil ||
 		failure.Global == nil || !failure.Global.SecurityRisk || message != securityRiskMessage {
 		t.Errorf("security risk failure: failure=%+v message=%q err=%v", failure, message, err)
@@ -249,14 +249,14 @@ func TestAuditOutcome(t *testing.T) {
 func TestAuditOutcomeDecodeError(t *testing.T) {
 	// An undecodable shape at either key is an error, not a silent pass.
 	if _, _, err := auditOutcome(map[string]any{
-		parallelAuditorsNodeName: "not a list",
-		medicalAuditAgentName:    MedicalAuditResult{Passed: true},
+		parallelAuditorsNodeName:   "not a list",
+		medicalAuditResultNodeName: MedicalAuditResult{Passed: true},
 	}); err == nil {
 		t.Error("undecodable factor results: want error")
 	}
 	if _, _, err := auditOutcome(map[string]any{
-		parallelAuditorsNodeName: []AuditResult{},
-		medicalAuditAgentName:    "not a result",
+		parallelAuditorsNodeName:   []AuditResult{},
+		medicalAuditResultNodeName: "not a result",
 	}); err == nil {
 		t.Error("undecodable global result: want error")
 	}

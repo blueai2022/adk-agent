@@ -3,6 +3,11 @@ package main
 type ReasonType string
 
 const (
+	// For most enums, unspecified is added to express agent's uninteantional missing a
+	// a value in its answer. Go resolve code after llmagent can normalize using the enum
+	// (think of it as gRPC's *_UNSPECIFIED)
+	ReasonUnspecified ReasonType = "unspecified"
+
 	// Rule-based for icd10 prefix marked with "complication_distinctive"
 	// Deferred: there is no such use cases in currently supported UW rules.
 	ReasonComplicationUnaccounted ReasonType = "complication_unaccounted"
@@ -76,18 +81,20 @@ const (
 	ReasonMedicalResearch ReasonType = "medical_research"
 )
 
-type FindingLevel string
-
-const (
-	FactorLevel FindingLevel = "factor"
-	GlobalLevel FindingLevel = "global"
-)
+// IsSecurityRisk reports whether a finding of this reason type is a safety flag
+// (as opposed to an ordinary audit disagreement).
+func (r ReasonType) IsSecurityRisk() bool {
+	return r == ReasonOverwhelmingInfo || r == ReasonMedicalResearch
+}
 
 type Finding struct {
-	Level      FindingLevel `json:"level"`
-	Factor     string       `json:"factor"` // expects value if finding is factor level
-	ReasonType ReasonType   `json:"reason_type"`
-	Reason     string       `json:"reason"`
+	Factor     string     `json:"factor"` // empty if finding is global level
+	ReasonType ReasonType `json:"reason_type"`
+	Reason     string     `json:"reason"`
+}
+
+func (f Finding) IsFactorLevel() bool {
+	return f.Factor != ""
 }
 
 // Medical audit covers blind spots in diagnosis determination by the core agent:
@@ -100,5 +107,5 @@ type Finding struct {
 type MedicalAuditResult struct {
 	Passed       bool      `json:"passed"`        // true when none of the blind spots below apply
 	SecurityRisk bool      `json:"security_risk"` // true for overwhelming medical info or medical research; never for trivial_condition alone
-	Findings     []Finding `json:"findings"`      // one entry per blind spot found
+	Findings     []Finding `json:"findings"`      // failed finding: one entry per blind spot found
 }

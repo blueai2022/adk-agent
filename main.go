@@ -136,7 +136,7 @@ func NewCoreSubAgent(client CoreAgentClient) (agent.Agent, error) {
 
 					return
 				}
-				if err := state.Set("core:medical_factors", resp.MedicalFactors); err != nil {
+				if err := state.Set(medicalFactorsKey, resp.MedicalFactors); err != nil {
 					yield(nil, err)
 
 					return
@@ -273,7 +273,7 @@ func coreSessionID(state session.ReadonlyState) (string, error) {
 
 // auditOutcome decodes the JoinNode's output - a map keyed by predecessor node
 // name, holding the []AuditResult from parallelAuditorsNodeName and the
-// MedicalAuditResult from medicalAuditAgentName - into the failure to report and
+// MedicalAuditResult from medicalAuditResultNodeName - into the failure to report and
 // the message to send the user. A nil failure means every factor and the global
 // medical audit passed, and the caller should reply with the core agent's own
 // response instead of message.
@@ -283,7 +283,7 @@ func auditOutcome(joined map[string]any) (failure *AuditFailure, message string,
 		return nil, "", fmt.Errorf("decode factor audit results: %w", err)
 	}
 
-	global, err := decodeAny[MedicalAuditResult](joined[medicalAuditAgentName])
+	global, err := decodeAny[MedicalAuditResult](joined[medicalAuditResultNodeName])
 	if err != nil {
 		return nil, "", fmt.Errorf("decode medical audit result: %w", err)
 	}
@@ -398,7 +398,7 @@ func run() error {
 	)
 
 	medicalSafetyNode, err := workflow.
-		NewAgentNodeTyped[MedicalSafetyInput, MedicalAuditResult](medicalSafetyAgent, cfg)
+		NewAgentNodeTyped[MedicalSafetyInput, MedicalSafetyVerdict](medicalSafetyAgent, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create medical safety node: %v", err)
 	}
@@ -485,10 +485,15 @@ func run() error {
 	)
 
 	medicalAuditNode, err := workflow.
-		NewAgentNodeTyped[MedicalAuditInput, MedicalAuditResult](medicalAuditAgent, cfg)
+		NewAgentNodeTyped[MedicalAuditInput, TrivialConditionVerdict](medicalAuditAgent, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create medical audit node: %v", err)
 	}
+
+	// Converter node: derives the MedicalAuditResult (Passed, SecurityRisk, findings)
+	// from the agent's per-factor verdicts. Its name is the join key gatherAudits reads.
+	medicalAuditResultNode := workflow.
+		NewFunctionNode(medicalAuditResultNodeName, medicalAuditResult, cfg)
 
 	// Fan-in barrier: waits for both the per-factor audits and the global medical
 	// audit before gatherAudits decides the final reply.
@@ -518,7 +523,7 @@ func run() error {
 	//                               └──continue───────────────────────────────────────────────────┼─> coreAgentNode
 	//                                                                                                     │
 	//                                                                               ┌──rating─> splitFactors ──────────> parallelAuditors ──┐
-	//                                                                               └──rating─> buildMedicalAuditInput ─> medicalAuditNode ──┼─> auditJoin ─> gatherAuditsNode
+	//                                                                               └──rating─> buildMedicalAuditInput ─> medicalAuditNode ─> medicalAuditResultNode ──┼─> auditJoin ─> gatherAuditsNode
 	edgeBuilder := workflow.NewEdgeBuilder()
 	edgeBuilder.Add(workflow.Start, safetyGateCheckNode)
 	edgeBuilder.AddRoute(
@@ -549,7 +554,8 @@ func run() error {
 	)
 	edgeBuilder.Add(splitFactors, parallelAuditors)
 	edgeBuilder.Add(buildMedicalAuditInput, medicalAuditNode)
-	edgeBuilder.AddFanIn(auditJoin, parallelAuditors, medicalAuditNode)
+	edgeBuilder.Add(medicalAuditNode, medicalAuditResultNode)
+	edgeBuilder.AddFanIn(auditJoin, parallelAuditors, medicalAuditResultNode)
 	edgeBuilder.Add(auditJoin, gatherAuditsNode)
 
 	rootAgent, err := workflowagent.New(workflowagent.Config{

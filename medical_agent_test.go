@@ -34,7 +34,7 @@ func TestNewMedicalAuditAgentWiring(t *testing.T) {
 		t.Errorf("agent name = %q, want %q", a.Name(), medicalAuditAgentName)
 	}
 
-	if _, err := workflow.NewAgentNodeTyped[MedicalAuditInput, MedicalAuditResult](a, workflow.NodeConfig{}); err != nil {
+	if _, err := workflow.NewAgentNodeTyped[MedicalAuditInput, TrivialConditionVerdict](a, workflow.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -46,8 +46,8 @@ func TestMedicalAuditFindingsArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(findings, "trivial_condition") {
-		t.Error("medical audit findings missing \"trivial_condition\"")
+	if !strings.Contains(findings, `"trivial"`) {
+		t.Error("medical audit findings missing the per-factor \"trivial\" answer")
 	}
 	for _, unwanted := range []string{"overwhelming_medical_info", "medical_research"} {
 		if strings.Contains(findings, unwanted) {

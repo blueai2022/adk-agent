@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
@@ -129,10 +130,14 @@ func safetyGateCheck(
 // ends the turn if detected, or passes the original turn to the core agent.
 func medicalSafetyGate(
 	ctx agent.Context,
-	result MedicalAuditResult,
+	verdict MedicalSafetyVerdict,
 	emit func(*session.Event) error,
 ) (any, error) {
-	if result.SecurityRisk {
+	if result := verdict.Result(); result.SecurityRisk {
+		log.Warn().
+			Interface("findings", result.Findings).
+			Msg("medical safety check flagged a security risk")
+
 		return securityRiskMessage, nil
 	}
 
