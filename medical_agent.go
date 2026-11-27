@@ -8,10 +8,12 @@ import (
 	"google.golang.org/adk/v2/model"
 )
 
-// medicalAuditAgentName is both the agent's Name and, since workflow.AgentNode
-// names a node after its wrapped agent, the JoinNode predecessor key gatherAudits
-// reads the global medical audit result from.
+// medicalAuditAgentName is the global medical audit agent's Name.
 const medicalAuditAgentName = "medical_audit_agent"
+
+// medicalAuditResultNodeName is the name of the node converting the agent's
+// LLM-friendly [...]Verdict into a MedicalAuditResult.
+const medicalAuditResultNodeName = "medical_audit_result"
 
 // medicalAuditBaseInstruction is the factor-independent part of the medical audit
 // agent's instruction. The findings file (artifacts/medical-audit-findings.md) is
@@ -41,8 +43,19 @@ func medicalAuditInput(resp *CoreAgentResponse) MedicalAuditInput {
 	return MedicalAuditInput{MedicalFactors: resp.MedicalFactors, History: resp.History}
 }
 
+// medicalAuditResult is the converter node's function: it derives the
+// MedicalAuditResult from the agent's TrivialConditionVerdict.
+func medicalAuditResult(ctx agent.Context, verdict TrivialConditionVerdict) (MedicalAuditResult, error) {
+	medicalFactors, err := readState[map[string]string](ctx.State(), medicalFactorsKey)
+	if err != nil {
+		return MedicalAuditResult{}, err
+	}
+
+	return trivialConditionResult(verdict.AllFactors(), medicalFactors), nil
+}
+
 // newMedicalAuditAgent builds the global medical audit LLM agent. Unlike the
-// per-factor audit_agent, it reviews the whole chat once per turn for blind spots: 
+// per-factor audit_agent, it reviews the whole chat once per turn for blind spots:
 // over-detected trivial conditions with no mortality implications for underwriting.
 func newMedicalAuditAgent(llm model.LLM) (agent.Agent, error) {
 	findings, err := readArtifact(findingsForms, "medical", "audit-findings")

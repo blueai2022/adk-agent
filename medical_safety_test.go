@@ -111,7 +111,7 @@ func TestNewMedicalSafetyAgentWiring(t *testing.T) {
 		t.Errorf("agent name = %q, want %q", a.Name(), medicalSafetyAgentName)
 	}
 
-	if _, err := workflow.NewAgentNodeTyped[MedicalSafetyInput, MedicalAuditResult](a, workflow.NodeConfig{}); err != nil {
+	if _, err := workflow.NewAgentNodeTyped[MedicalSafetyInput, MedicalSafetyVerdict](a, workflow.NodeConfig{}); err != nil {
 		t.Fatal(err)
 	}
 }

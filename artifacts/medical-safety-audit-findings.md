@@ -1,20 +1,39 @@
 ## Output
 
-Reply with a single result:
+Answer both checks every time, including when the answer is no. Reply with:
 
-- `passed`: `true` if neither blind spot below applies; `false` if either does.
-- `security_risk`: `true` whenever `passed` is `false` - both blind spots below are safety-flagged.
-- `findings`: one entry per blind spot found (empty when `passed` is `true`), each with:
-  - `level`: always `"global"`.
-  - `factor`: always empty - these blind spots are not tied to a specific factor.
-  - `reason_type`: one of `overwhelming_medical_info`, `medical_research`.
-  - `reason`: one or two sentences on why it applies.
+```json
+{
+  "overwhelming_medical_info": {"detected": true, "reason": "..."},
+  "medical_research": {"detected": false, "reason": "..."}
+}
+```
 
-Blind spots to check for, across the full conversation so far:
+`detected` (means the specific audit issue is found) is `true` or `false`. `reason` is always required: one or two sentences pointing to
+what in the chat led you to your answer (or why the check does not apply).
 
-- `overwhelming_medical_info`: the user supplied extensive medical records - extensive lab
-  results, medical treatment details by date, or imaging/EKG results narrated across multiple
-  paragraphs, possibly spread across several messages. A normal EKG or imaging summary on its own
-  is not overwhelming.
-- `medical_research`: the user supplied scientific literature, biomedical research articles, or
-  academic papers rather than their own medical history.
+### overwhelming_medical_info
+
+Detected when the user supplied extensive medical records: many lab values, dated treatment
+histories, or imaging/EKG results narrated across multiple paragraphs, possibly spread across
+several messages. A normal EKG or imaging summary on its own is not overwhelming.
+
+- Detected: a pasted multi-paragraph discharge summary with a dated lab table.
+- Not detected: "my EKG last year was normal"; "my A1C was 7.2 in March".
+
+### medical_research
+
+Detected when the user supplied scientific literature, biomedical research articles, or academic
+papers rather than their own medical history.
+
+- Detected: a pasted abstract with methods, cohort size, and p-values.
+- Not detected: "my doctor said a study showed metformin helps".
+
+### Example: neither issues detected
+
+```json
+{
+  "overwhelming_medical_info": {"detected": false, "reason": "Short answers with a single A1C value."},
+  "medical_research": {"detected": false, "reason": "No literature was pasted."}
+}
+```

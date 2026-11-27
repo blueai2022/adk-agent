@@ -21,11 +21,12 @@ var inputRulesDocs embed.FS
 // defaultFindingsKey names the findings file used for factors without their own.
 const defaultFindingsKey = "default"
 
-// factorIDsKey and factorStatesKey are the session state keys under which the core
-// sub-agent stores the ICD-10 -> factor ID mapping and the per-factor states.
+// Session state keys under which the core sub-agent stores the ICD-10 -> factor
+// ID mapping, the per-factor states and and the detected ICD-10 -> medical factors.
 const (
-	factorIDsKey    = "core:factor_ids"
-	factorStatesKey = "core:factor_states"
+	factorIDsKey      = "core:factor_ids"
+	factorStatesKey   = "core:factor_states"
+	medicalFactorsKey = "core:medical_factors"
 )
 
 // auditBaseInstruction is the factor-independent part of the audit agent's instruction.
