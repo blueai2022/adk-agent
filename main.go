@@ -490,10 +490,14 @@ func run() error {
 		return fmt.Errorf("failed to create medical audit node: %v", err)
 	}
 
-	// Converter node: derives the MedicalAuditResult (Passed, SecurityRisk, findings)
-	// from the agent's per-factor verdicts. Its name is the join key gatherAudits reads.
-	medicalAuditResultNode := workflow.
-		NewFunctionNode(medicalAuditResultNodeName, medicalAuditResult, cfg)
+	trivialCheckNode := newTrivialCheckNode(medicalAuditNode, cfg)
+	globalChecks := []workflow.Node{trivialCheckNode}
+
+	globalJoin := workflow.NewJoinNode("global_join")
+
+	// Merge node: folds the global checks' results into one MedicalAuditResult. Its
+	// name is the join key gatherAudits reads.
+	medicalAuditResultNode := newMergeGlobalNode(globalChecks, cfg)
 
 	// Fan-in barrier: waits for both the per-factor audits and the global medical
 	// audit before gatherAudits decides the final reply.
@@ -523,7 +527,8 @@ func run() error {
 	//                               └──continue───────────────────────────────────────────────────┼─> coreAgentNode
 	//                                                                                                     │
 	//                                                                               ┌──rating─> splitFactors ──────────> parallelAuditors ──┐
-	//                                                                               └──rating─> buildMedicalAuditInput ─> medicalAuditNode ─> medicalAuditResultNode ──┼─> auditJoin ─> gatherAuditsNode
+	//                                                                               └──rating─> buildMedicalAuditInput ─┬─> checkTrivialNode (RunNode ─> medicalAuditNode) ─┐
+	//                                                                                                                   └─> (further global checks) ────────────────────────┴─> globalJoin ─> medicalAuditResultNode ──┼─> auditJoin ─> gatherAuditsNode
 	edgeBuilder := workflow.NewEdgeBuilder()
 	edgeBuilder.Add(workflow.Start, safetyGateCheckNode)
 	edgeBuilder.AddRoute(
@@ -553,8 +558,9 @@ func run() error {
 		workflow.StringRoute(routeRating),
 	)
 	edgeBuilder.Add(splitFactors, parallelAuditors)
-	edgeBuilder.Add(buildMedicalAuditInput, medicalAuditNode)
-	edgeBuilder.Add(medicalAuditNode, medicalAuditResultNode)
+	edgeBuilder.AddFanOut(buildMedicalAuditInput, globalChecks...)
+	edgeBuilder.AddFanIn(globalJoin, globalChecks...)
+	edgeBuilder.Add(globalJoin, medicalAuditResultNode)
 	edgeBuilder.AddFanIn(auditJoin, parallelAuditors, medicalAuditResultNode)
 	edgeBuilder.Add(auditJoin, gatherAuditsNode)
 
